@@ -1,0 +1,1421 @@
+---
+title: "Single-cell RNAseq (10x) of SFB-specific B cells from mice, with BCR sequencing: load, QC, demultiplex, and clean data"
+author: "Matt Dufort"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 5
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+<style type="text/css">
+body{ /* Normal  */
+      font-size: 14px;
+  }
+h1 { /* Header 1 */
+  font-size: 28px;
+}
+h2 { /* Header 2 */
+    font-size: 24px;
+}
+h3 { /* Header 3 */
+  font-size: 20px;
+}
+h4 { /* Header 4 */
+  font-size: 16px;
+}
+</style>
+
+# Project Summary
+
+This script includes analyses used in Verma et al. 2023 (https://doi.org/10.1101/2023.10.13.562275). The data are from 10x Genomics sequencing of SFB-specific B cells from mouse Peyer's patches. Data include both single-cell RNAseq and paired BCR sequencing. The samples contain cells from 10 mice, multiplexed using hashtag barcoding.
+
+This script loads the data, performs QC on the 10x single-cell data, demultiplexes the cells to source mouse, and performs basic analyses of the data. The script then outputs files that are used in later steps.
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+if (!require(knitr)) install.packages("knitr"); library(knitr)
+
+# data munging and coding tools
+if (!require(tidyverse)) install.packages("tidyverse"); library(tidyverse)
+if (!require(magrittr)) install.packages("magrittr"); library(magrittr)
+
+# visualization tools
+if (!require(kableExtra)) install.packages("kableExtra"); library(kableExtra)
+if (!require(plotscale)) install.packages("plotscale"); library(plotscale)
+
+# Seurat
+if (!require(Seurat)) install.packages("Seurat"); library(Seurat)
+
+# BCR analysis tools
+if (!require(shazam)) install.packages("shazam"); library(shazam)
+
+# Custom packages
+if (!require(miscHelpers)) devtools::install_github("BenaroyaResearch/miscHelpers"); library(miscHelpers)
+
+# set Rmarkdown options
+opts_chunk$set(
+  fig.width = 6, fig.height = 4.25, 
+  cache = TRUE, # caching does not work with large Seurat objects
+  echo = FALSE, warning = FALSE, message = FALSE)
+options(stringsAsFactors = FALSE)
+
+# set default theme for plots
+theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+          axis.text = element_text(colour = "black"),
+          axis.ticks = element_line(colour = "black"),
+          axis.text.x = element_text(angle = 0)))
+update_geom_defaults("point", list(shape = 16))
+grDevices::pdf.options(useDingbats = FALSE)
+```
+
+```{r setFilenamesAndGlobalVariables}
+dirRoot <- file.path("~", "SFB_B_cells_10x")
+
+# set directory from which to load data
+dirData <- file.path(dirRoot, "data")
+
+# set (and create) directory for plot output
+dirPlots <- file.path(dirRoot, "plots")
+if (!dir.exists(dirPlots)) dir.create(dirPlots)
+
+# set (and create) directory for saved data
+dirDataSaved <- file.path(dirRoot, "data_saved")
+if (!dir.exists(dirDataSaved)) dir.create(dirDataSaved)
+```
+
+```{r setDirectory, cache=FALSE}
+opts_knit$set(root.dir = dirRoot)
+setwd(dirRoot)
+```
+
+# Load project data
+
+## Load sample annotation
+
+```{r setHtoSampleId}
+# generate data frame with hashtag-mouse links; easier to update the naming this way
+nSamples.tmp <- 10
+
+sampleBarcodes <- paste0("HTO-M", 1:nSamples.tmp)
+sampleNames <- paste0("mouse", 1:nSamples.tmp)
+
+linkSampleBarcodeToSampleName <-
+  data.frame(
+    sampleBarcode = 
+      c(sampleBarcodes, "multiplePositive", "unassigned") %>%
+      factor(levels = str_sort(., numeric = TRUE)),
+    sampleName =
+      c(sampleNames, "multiplePositive", "unassigned") %>%
+      factor(levels = str_sort(., numeric = TRUE)))
+
+rm_tmp(ask = FALSE)
+```
+
+## Generate color palettes for downstream use
+
+```{r setupPalettes, dependson=c("combineAnnotationMetrics", "loadPalettesAndSettings")}
+# set default resolution for raster layers
+rasterResolutionDpi <- 300
+
+# palette for sampleBarcode with colors for HTO_M1 through HTO_M10, black for unassigned, red for multiplePositive
+palSampleBarcode <-
+  big_colorblind_pal(
+    n_colors = 11,
+    drop_yellow = TRUE, drop_black = FALSE) %>%
+  # B0251 = Hashtag1, B0260 = Hashtag2
+  setNames(c("unassigned", paste0("HTO-M", 1:10))) %>%
+  c("multiplePositive" = "red")
+
+# palette for isotypes
+palIsotype <-
+  big_colorblind_pal(6) %>%
+  setNames(c("IgM", "IgD", "IgA", "IgG1", "IgG2b", "IgG2c")) %>%
+  c("undetermined" = "grey50")
+
+# color palette for plotting gene counts, e.g. on tSNE and UMAP plots
+colsGeneCounts <- c("gray90", "darkblue")
+```
+
+## Load 10x data matrix
+
+```{r loadData10x, dependson="getProjectInfo"}
+# set counts filename
+filenameInputData10X <-
+  file.path(dirData, "sample_feature_bc_matrix.h5")
+
+inputData10x <-
+  Seurat::Read10X_h5(filenameInputData10X)
+
+# filter gene expression data to include only protein-coding and [TB]CR genes
+biotypeRegex.tmp <-
+  "(protein_coding)|(IG_[CVDJ]_gene)|(TR_[CVDJ]_gene)"
+inputData10x$`Gene Expression` <-
+  inputData10x$`Gene Expression`[
+    rownames(inputData10x$`Gene Expression`) %in% 
+      (annotables::grcm38 %>%
+         dplyr::filter(str_detect(biotype, biotypeRegex.tmp)) %>%
+         dplyr::pull(symbol)),]
+
+# create Seurat object with RNA and HTO data
+data10xUnfiltered <-
+  CreateSeuratObject(counts = inputData10x$`Gene Expression`)
+data10xUnfiltered[["HTO"]] <- CreateAssayObject(counts = inputData10x$`Antibody Capture`)
+
+# also store the cellBarcode as a column, in case it gets lost from the rownames of the meta.data slot
+data10xUnfiltered <- data10xUnfiltered %>%
+  AddMetaData(
+    metadata = colnames(data10xUnfiltered),
+    col.name = "cellBarcode")
+```
+
+```{r loadData10xVdj, dependson="loadData10x"}
+## load contigs
+filenameFilteredContigAnnotations <-
+  file.path(dirData, "filtered_contig_annotations.csv")
+data10xVdjUnfiltered <-
+  read.csv(filenameFilteredContigAnnotations) %>%
+  # store cellBarcode
+  dplyr::rename(cellBarcode = barcode,
+                cellBarcodeContig = contig_id) %>%
+  # store full variable region nucleotide sequence
+  dplyr::mutate(
+    varRegionSequence = paste0(fwr1_nt, cdr1_nt, fwr2_nt, cdr2_nt, fwr3_nt, cdr3_nt, fwr4_nt),
+    is_cell = is_cell == "true",
+    full_length = full_length == "true",
+    productive = productive == "true",
+    contigNumPerCell = str_extract(cellBarcodeContig, "contig_[0-9]+"))
+
+## pull in AIRR rearrangements, which includes a bunch of useful stuff
+filenameAirrRearrangements <-
+  file.path(dirData, "airr_rearrangement.tsv")
+data10xVdjRearrangements.tmp <-
+  readr::read_delim(
+    filenameAirrRearrangements, delim = "\t") %>%
+  dplyr::rename(
+    cellBarcode = cell_id,
+    raw_clonotype_id = clone_id,
+    cellBarcodeContig = sequence_id,
+    reads = consensus_count,
+    umis = duplicate_count)
+# merge contig annotations and AIRR rearrangements
+data10xVdjUnfiltered <-
+  data10xVdjUnfiltered %>%
+  full_join(data10xVdjRearrangements.tmp)
+  
+## load clonotype assignment data
+filenameClonotypes <-
+  file.path(dirData, "clonotypes.csv")
+data10xVdjClonotypes <-
+  readr::read_csv(filenameClonotypes)
+```
+
+# Quality control of cells using GEX data
+
+## Filter cells based on quality metrics
+
+We use several metrics to identify high-quality cells:
+1) Total UMI counts in each cell
+2) Percent mitochondrial reads for each cell
+3) Percent ribosomal reads for each cell
+
+```{r calculateQcMetrics, dependson="loadData10x"}
+data10xUnfiltered <- 
+  PercentageFeatureSet(data10xUnfiltered, "^mt-", col.name = "percent_mito") # percent mitochondrial reads
+data10xUnfiltered <-
+  PercentageFeatureSet(data10xUnfiltered, "^Rp[sl]", col.name = "percent_ribo") # percent ribosomal protein reads
+data10xUnfiltered <-
+  PercentageFeatureSet(data10xUnfiltered, "^Hb[^(p)]", col.name = "percent_hb") # percent hemoglobin reads
+```
+
+```{r setQcMetricsThresholds}
+qcMetricsThresholds <-
+  c(
+    "min_nFeature_RNA" = 250,
+    "max_nFeature_RNA" = 6000,
+    "min_nCount_RNA" = 1400,
+    "max_nCount_RNA" = 35000,
+    # "nFeature_ADT" = 50,
+    # "nCount_ADT" = 500,
+    "percent_mito" = 20,
+    "percent_ribo" = 50,
+    "percent_hb" = 10
+  )
+
+qcMetricsDfForPlot <-
+  data.frame(
+    metric = str_replace(names(qcMetricsThresholds), "^(min|max)_", ""),
+    threshold = unname(qcMetricsThresholds)
+  )
+```
+
+```{r plotQcMetrics, dependson="calculateQcMetrics", fig.width=12, fig.height=7}
+qcMetrics.tmp <-
+  c("nFeature_RNA", "nCount_RNA",
+    # "nFeature_ADT", "nCount_ADT",
+    "percent_mito", "percent_ribo", "percent_hb")
+
+plot.tmp <-
+  data10xUnfiltered@meta.data %>%
+  dplyr::select(all_of(qcMetrics.tmp)) %>%
+  pivot_longer(cols = one_of(qcMetrics.tmp), names_to = "metric", values_to = "value") %>%
+  mutate(metric = metric %>% factor(levels = qcMetrics.tmp)) %>%
+  ggplot(mapping = aes(x = "sample", y = value)) +
+  geom_violin() +
+  ggrastr::rasterise(
+    geom_jitter(height = 0.1, size = 0.5), # set a small vertical jitter to reveal density
+    dpi = rasterResolutionDpi) +
+  facet_wrap(facets = vars(metric), ncol = 3, scales = "free_y") +
+  geom_hline(
+    data =
+      qcMetricsDfForPlot %>%
+      dplyr::filter(metric %in% qcMetrics.tmp) %>%
+      mutate(metric = metric %>% factor(levels = qcMetrics.tmp)),
+    mapping = aes(yintercept = threshold),
+    color = "red", linetype = "dashed") +
+  theme(
+    axis.text.x = element_blank(),
+    # axis.text.x = element_text(angle = -45, hjust=0, size = 10),
+    strip.text=element_text(size = rel(0.8), margin=margin(t=3, b=3))) +
+  labs(x = NULL, y = NULL)
+
+print(plot.tmp)
+
+as.pdf(
+  plot.tmp,
+  file = file.path(dirPlots, "plotQcMetrics.pdf"),
+  width = 3, height = 3)
+
+rm_tmp(ask=FALSE)
+```
+
+```{r filterCellsQcMetrics, dependson=c("setQcMetricsThresholds", "calculateQcMetrics")}
+cellsKeepQcMetrics <-
+  WhichCells(
+    data10xUnfiltered,
+    expression = nFeature_RNA >= qcMetricsThresholds["min_nFeature_RNA"]) %>% # keeps 2841 of 2984
+  intersect(
+    WhichCells(
+      data10xUnfiltered,
+      expression = nFeature_RNA <= qcMetricsThresholds["max_nFeature_RNA"])) %>% # keeps 2780 of 2841
+  intersect(
+    WhichCells(
+      data10xUnfiltered,
+      expression = nCount_RNA >= qcMetricsThresholds["min_nCount_RNA"])) %>% # keeps 2353 of 2780
+  intersect(
+    WhichCells(
+      data10xUnfiltered,
+      expression = nCount_RNA <= qcMetricsThresholds["max_nCount_RNA"])) %>% # keeps 2308 of 2353
+  intersect(
+    WhichCells(
+      data10xUnfiltered, expression = percent_mito <= qcMetricsThresholds["percent_mito"])) %>% # keeps 2277 of 2308
+  intersect(
+    WhichCells(
+      data10xUnfiltered, expression = percent_ribo <= qcMetricsThresholds["percent_ribo"])) %>% # keeps 2276 of 2277
+  intersect(
+    WhichCells(
+      data10xUnfiltered, expression = percent_hb <= qcMetricsThresholds["percent_hb"])) # keeps 2276 of 2276
+
+cellsDropQcMetrics <-
+  setdiff(colnames(data10xUnfiltered), cellsKeepQcMetrics)
+
+data10xIncNonBCells <-
+  subset(data10xUnfiltered, cells = cellsKeepQcMetrics)
+```
+
+## Filter cells based on expression of expected and unexpected genes
+
+In addition, we want to exclude any cells that are not B cells. These may be contaminating immune cells, especially those that bind with B cells and may therefore have been *stuck* to cells during the sort, or intestinal epithelial cells that somehow made it through the sort. We will filter to B cells by requiring low levels of some genes expressed by other cell types, and requiring higher levels of some key B cell genes.
+
+```{r setNonBCellGeneThresholds}
+# thresholds for genes expressed in other cell types; exclude any cells expressing higher levels of these genes
+nonBCellGeneThresholds <-
+  c("Cd3d" = 3, # T cell gene
+    "Cd3e" = 3, # T cell gene
+    "Vil1" = 1, # non-lymphoic cell gene
+    "Reg3g" = 2 # non-lymphoic cell gene
+  )
+
+nonBCellGeneThresholdsDfForPlot <-
+  data.frame(
+    gene = names(nonBCellGeneThresholds),
+    threshold = unname(nonBCellGeneThresholds))
+```
+
+```{r plotExpressionNonBCellGenes, dependson=c("setNonBCellGeneThresholds", "filterCellsQcMetrics"), fig.width=8.5, fig.height=7}
+genesToPlot.tmp <- nonBCellGeneThresholdsDfForPlot$gene
+
+plot.tmp <-
+  data10xIncNonBCells@assays$RNA@counts[genesToPlot.tmp,] %>%
+  as.matrix() %>%
+  t() %>%
+  as.data.frame() %>%
+  pivot_longer(
+    cols = everything(), names_to = "gene", values_to = "count") %>%
+  mutate(gene = factor(gene, levels = genesToPlot.tmp)) %>%
+  ggplot(mapping = aes(x = "sample", y = count)) +
+  geom_violin() +
+  ggrastr::rasterise(
+    geom_jitter(height = 0.1, size = 0.5), # set a small vertical jitter to reveal density
+    dpi = rasterResolutionDpi) +
+  facet_wrap(facets = vars(gene), ncol = 2, scales = "free_y") +
+  geom_hline(
+    data =
+      nonBCellGeneThresholdsDfForPlot %>%
+      dplyr::filter(gene %in% genesToPlot.tmp) %>%
+      mutate(gene = gene %>% factor(levels = genesToPlot.tmp)),
+    mapping = aes(yintercept = threshold),
+    color = "red", linetype = "dashed") +
+  theme(
+    axis.text.x = element_blank(),
+    # axis.text.x = element_text(angle = -45, hjust=0, size = 10),
+    strip.text=element_text(size = rel(0.8), margin=margin(t=3, b=3))) +
+  labs(x = NULL, y = NULL)
+
+print(plot.tmp)
+
+as.pdf(
+  plot.tmp,
+  file = file.path(dirPlots, "plotExpressionNonBCellGenes.pdf"),
+  width = 3, height = 3)
+
+rm_tmp(ask=FALSE)
+```
+
+```{r setBCellGeneThresholds}
+## thresholds for genes expressed in B cells, based on plots of normalized counts of data further downstream in earlier analyses
+BCellGeneThresholds <-
+  c("Cd74" = 2,
+    "H2-Ab1" = 0.5,
+    "Cd79a" = 0.5,
+    "Ly6e" = 0.5,
+    "Cd52" = 0.25)
+
+BCellGeneThresholdsDfForPlot <-
+  data.frame(
+    gene = names(BCellGeneThresholds),
+    threshold = unname(BCellGeneThresholds)
+  )
+```
+
+```{r plotExpressionBCellGenes, dependson=c("setBCellGeneThresholds", "filterCellsQcMetrics"), fig.width=12.5, fig.height=7}
+genesToPlot.tmp <-
+  BCellGeneThresholdsDfForPlot$gene
+
+# normalize the data, as levels of these genes are much cleaner in normalized data
+data.tmp <-
+  data10xIncNonBCells %>%
+  NormalizeData(assay = "RNA", normalization.method = "LogNormalize")
+
+plot.tmp <-
+  data.tmp@assays$RNA@data[genesToPlot.tmp,] %>%
+  as.matrix() %>%
+  t() %>%
+  as.data.frame() %>%
+  pivot_longer(
+    cols = everything(), names_to = "gene", values_to = "count") %>%
+  mutate(gene = factor(gene, levels = genesToPlot.tmp)) %>%
+  ggplot(mapping = aes(x = "sample", y = count)) +
+  geom_violin() +
+  ggrastr::rasterise(
+    geom_jitter(height = 0.1, size = 0.5), # set a small vertical jitter to reveal density
+    dpi = rasterResolutionDpi) +
+  facet_wrap(facets = vars(gene), ncol = 3, scales = "free_y") +
+  geom_hline(
+    data =
+      BCellGeneThresholdsDfForPlot %>%
+      dplyr::filter(gene %in% genesToPlot.tmp) %>%
+      mutate(gene = gene %>% factor(levels = genesToPlot.tmp)),
+    mapping = aes(yintercept = threshold),
+    color = "red", linetype = "dashed") +
+  theme(
+    axis.text.x = element_blank(),
+    # axis.text.x = element_text(angle = -45, hjust=0, size = 10),
+    strip.text=element_text(size = rel(0.8), margin=margin(t=3, b=3))) +
+  labs(x = NULL, y = NULL)
+
+print(plot.tmp)
+
+as.pdf(
+  plot.tmp,
+  file = file.path(dirPlots, "plotExpressionBCellGenes.pdf"),
+  width = 3, height = 3)
+
+rm_tmp(ask=FALSE)
+```
+
+```{r filterCellsGeneThresholds, dependson=c("setNonBCellGeneThresholds", "setBCellGeneThresholds", "filterCellsQcMetrics")}
+# normalize data for filtering
+data10xIncNonBCells <-
+  data10xIncNonBCells %>%
+  NormalizeData(assay = "RNA", normalization.method = "LogNormalize")
+  
+cellsKeepGeneThresholds <-
+  # drop T cells based on Cd3d
+  WhichCells(
+    data10xIncNonBCells, slot = "counts", # use raw counts
+    expression = Cd3d < nonBCellGeneThresholds[["Cd3d"]]) %>% # keeps 2271 of 2276
+  # drop T cells based on Cd3e
+  intersect(
+    WhichCells(
+      data10xIncNonBCells, slot = "counts", # use raw counts
+      expression = Cd3e < nonBCellGeneThresholds[["Cd3e"]])) %>% # keeps 2271 of 2271
+  # drop other non-B cells based on Vil1
+  intersect(
+    WhichCells(
+      data10xIncNonBCells, slot = "counts", # use raw counts
+      expression = Vil1 < nonBCellGeneThresholds[["Vil1"]])) %>% # keeps 2267 of 2271
+  # drop other non-B cells based on Reg3g
+  intersect(
+    WhichCells(
+      data10xIncNonBCells, slot = "counts", # use raw counts
+      expression = Reg3g < nonBCellGeneThresholds[["Reg3g"]])) %>% # keeps 2266 of 2267
+  # keep only B cells based on Cd74
+  intersect(
+    WhichCells(
+      data10xIncNonBCells, slot = "data", # use normalized counts
+      expression = Cd74 > BCellGeneThresholds[["Cd74"]])) %>% # keeps 2261 of 2266
+  # keep only B cells based on H2-Ab1
+  intersect(
+    WhichCells(
+      data10xIncNonBCells, slot = "data", # use normalized counts
+      expression = `H2-Ab1` > BCellGeneThresholds[["H2-Ab1"]])) %>% # keeps 2233 of 2261
+  # keep only B cells based on Cd79a
+  intersect(
+    WhichCells(
+      data10xIncNonBCells, slot = "data", # use normalized counts
+      expression = Cd79a > BCellGeneThresholds[["Cd79a"]])) %>% # keeps 2203 of 2233
+  # keep only B cells based on Ly6e
+  intersect(
+    WhichCells(
+      data10xIncNonBCells, slot = "data", # use normalized counts
+      expression = Ly6e > BCellGeneThresholds[["Ly6e"]])) %>% # keeps 2159 of 2203
+  # keep only B cells based on Cd52
+  intersect(
+    WhichCells(
+      data10xIncNonBCells, slot = "data", # use normalized counts
+      expression = Cd52 > BCellGeneThresholds[["Cd52"]])) # keeps 2133 of 2159
+
+cellsDropGeneThresholds <-
+  setdiff(colnames(data10xIncNonBCells), cellsKeepGeneThresholds)
+
+data10xIncMultiplets <-
+  subset(data10xIncNonBCells, cells = cellsKeepGeneThresholds)
+```
+
+# Hashtag demultiplexing of samples
+
+## Determine hashtag counts and positivity using distributions of hashtag counts
+
+Our  approach for assigning cells to hashtags is to use a simple threshold for each hashtag. Based on plots of the hashtag distributions, we can use the same threshold for each hashtag, and the logCpm appears to be the most effect.
+
+We identify each mouse based on the hashtag used to label cells from that mouse. So mouse1 = HTO-M1, mouse2 = HTO-M2, and so on.
+
+```{r calculateHashtagCounts, dependson="calculateLogXYratio"}
+# calculate logCpm for each
+offset.tmp <- 1
+data10xIncMultiplets <- data10xIncMultiplets %>%
+  AddMetaData(
+    metadata =
+      log(t(as.matrix(data10xIncMultiplets[["HTO"]]@counts + offset.tmp) ) /
+            data10xIncMultiplets$nCount_HTO * 1e6) %>%
+      as.data.frame() %>%
+      set_colnames(make.names(paste0("logCpm", colnames(.))))
+  )
+
+rm_tmp(ask=FALSE)
+```
+
+```{r setThresholdsHto}
+thresholdsHto <-
+  list(logCpm = c("posAbove" = 12, "negBelow" = 11.5, "minGap" = 1.5))
+```
+
+### Plot barcode distributions, log CPM
+
+To verify the appropriate thresholds for determining which cells are positive and negative for a given hashtag, we use the plots below.
+
+```{r plotBarcodelogCpmDistributionAllSamples, dependson=c("calculateHashtagCounts", "setupPalettes"), fig.width=10, fig.height=6}
+data10xIncMultiplets@meta.data %>%
+  pivot_longer(
+    cols = matches("logCpmHTO"),
+    names_to = "hashtag", names_prefix = "clrMd",
+    values_to = "count") %>%
+  ggplot(mapping = aes(x = count)) +
+  geom_density(size = 1) +
+  facet_wrap(vars(hashtag), nrow = 2) +
+  labs(x = "Hashtag counts (log CPM)") +
+  geom_vline(
+    xintercept = thresholdsHto[["logCpm"]]["negBelow"],
+    linetype = "dashed", color = "red") +
+  geom_vline(
+    xintercept = thresholdsHto[["logCpm"]]["posAbove"],
+    linetype = "dashed", color = "blue")
+```
+
+### Assign cells to hashtag using barcode count thresholds
+
+```{r hashtagDemultiplexingThresholdLogCpm, dependson=c("calculateHashtagCounts", "setThresholdsHTO")}
+logCpmHTO.tmp <-
+  data10xIncMultiplets@meta.data %>%
+  dplyr::select(matches("logCpmHTO"))
+
+thresholdLogCpmHTOStatus.tmp <-
+  matrix(
+    "ambiguous",
+    nrow = nrow(logCpmHTO.tmp), ncol = ncol(logCpmHTO.tmp),
+    dimnames = dimnames(logCpmHTO.tmp))
+
+thresholdLogCpmHTOStatus.tmp[logCpmHTO.tmp > thresholdsHto[["logCpm"]]["posAbove"]] <- "positive"
+thresholdLogCpmHTOStatus.tmp[logCpmHTO.tmp < thresholdsHto[["logCpm"]]["negBelow"]] <- "negative"
+
+## assign cells based on posAbove, negBelow, and minGap
+# positive if x > posAbove
+# negative if (max(x) - x) > minGap
+# ambiguous if neither of the cases above applies
+# multiplePositive if more than one is not negative (positive or ambiguous)
+# single positive if one is positive and all others are negative
+# unassigned if neither of the cases above applies (either all are negative/ambiguous, or one is positive and one or more is ambiguous)
+thresholdLogCpmHTOStatus.tmp <-
+  matrix(
+    "ambiguous",
+    nrow = nrow(logCpmHTO.tmp), ncol = ncol(logCpmHTO.tmp),
+    dimnames = dimnames(logCpmHTO.tmp))
+thresholdLogCpmHTOStatus.tmp[logCpmHTO.tmp > thresholdsHto[["logCpm"]]["posAbove"]] <- "positive"
+thresholdLogCpmHTOStatus.tmp[
+  t(apply(logCpmHTO.tmp, MARGIN = 1, function(x) {max(x) - x})) >
+    thresholdsHto[["logCpm"]]["minGap"]] <-
+    "negative"
+
+sampleBarcode.tmp <- rep("unassigned", ncol(data10xIncMultiplets))
+
+# identify multiplePositive
+cells.tmp <-
+  which(apply(thresholdLogCpmHTOStatus.tmp, 
+        MARGIN = 1, FUN = function(x) {sum(x %in% c("ambiguous", "positive")) > 1}))
+sampleBarcode.tmp[cells.tmp] <- "multiplePositive"
+
+# identify single positives
+cells.tmp <-
+  which(apply(thresholdLogCpmHTOStatus.tmp,
+        MARGIN = 1, 
+        FUN = function(x) {(sum(x %in% "positive") == 1) & (sum(x %in% "ambiguous") == 0)}))
+sampleBarcode.tmp[cells.tmp] <-
+  colnames(thresholdLogCpmHTOStatus.tmp)[
+    apply(thresholdLogCpmHTOStatus.tmp[cells.tmp,],
+          MARGIN = 1, function(x) which(x %in% "positive"))] %>%
+  str_replace_all("logCpmHTO.", "HTO-")
+
+sampleBarcode.tmp <-
+  sampleBarcode.tmp %>%
+  factor(levels = str_sort(unique(.), numeric=TRUE))
+
+# add to Seurat object metadata
+data10xIncMultiplets <- data10xIncMultiplets %>%
+  AddMetaData(
+    metadata = sampleBarcode.tmp,
+    col.name = "sampleBarcodeThresholdLogCpm")
+
+rm_tmp(ask=FALSE)
+```
+
+```{r countCellsBySampleBarcodeThresholdLogCpm, dependson="hashtagDemultiplexingThresholdLogCpm"}
+data10xIncMultiplets@meta.data %>%
+  dplyr::group_by(sampleBarcodeThresholdLogCpm) %>%
+  dplyr::summarise(nCells = n()) %>%
+  kable(row.names = F,
+        caption = "Hashtag demultiplexing by ThresholdLogCpm") %>%
+  kable_styling(full_width = F, 
+                position = "left")
+```
+
+```{r plotBiaxialAndRidgeHtoLogCpmBySampleBarcodeThresholdLogCpm, dependson="hashtagDemultiplexingThresholdLogCpm"}
+plot.tmp <-
+  GGally::ggpairs(
+    data10xIncMultiplets@meta.data,
+    columns = make.names(paste0("logCpm", sampleBarcodes)),
+    upper = list(continuous = "blank"),
+    aes(color = sampleBarcodeThresholdLogCpm,
+        alpha = 0.4)) +
+  scale_color_manual(values = palSampleBarcode) +
+  scale_fill_manual(values = palSampleBarcode) +
+  theme(strip.text = element_text(size = rel(0.4)),
+        axis.text = element_text(size = 10))
+
+pdf(
+  file.path(
+    dirPlots, 
+    "scatterplotsHtoLogCpmBySampleBarcodeThresholdLogCpm.pdf"),
+  height = 20, width = 20)
+print(plot.tmp)
+invisible(dev.off())
+
+
+plot.tmp <-
+  RidgePlot(
+    data10xIncMultiplets, 
+    assay = "HTO", 
+    features =
+      make.names(
+        paste0("logCpm", sampleBarcodes)), 
+    group.by = "sampleBarcodeThresholdLogCpm",
+    same.y.lims = TRUE,
+    ncol = 5) &
+  scale_fill_manual(values = palSampleBarcode) &
+  labs(x = NULL) &
+  theme(axis.text.y = element_text(size = 10))
+
+pdf(
+  file.path(
+    dirPlots, 
+    "ridgeplotsHtoLogCpmBySampleBarcodeThresholdLogCpm.pdf"),
+  height = 8, width = 20)
+print(plot.tmp)
+invisible(dev.off())
+
+rm_tmp(ask=FALSE)
+```
+
+## Assign demultiplexing calls, and remove multiplets identified by double-positive for barcode counts
+
+```{r assignSampleBarcodes, dependson=c("hashtagDemultiplexingHTODemux", "hashtagDemultiplexingThresholdLogCpm")}
+sampleBarcodeUsed <- "sampleBarcodeThresholdLogCpm"
+# sampleBarcodeUsed <- "sampleBarcodeHTODemux"
+
+# for the original combined version of the data
+data10xIncMultiplets@meta.data <-
+  data10xIncMultiplets@meta.data %>%
+  dplyr::mutate(sampleBarcode = !!rlang::sym(sampleBarcodeUsed)) %>%
+  left_join(linkSampleBarcodeToSampleName)
+rownames(data10xIncMultiplets@meta.data) <- data10xIncMultiplets@meta.data$cellBarcode
+```
+
+```{r saveData10xBeforeRemoveDoublets, dependson="assignSampleBarcodes"}
+# save version of data10xIncMultiplets for easier recovery
+filenameData10xCompleteIncDoublets <-
+  file.path(dirDataSaved, 
+            "data10xCompleteIncDoublets.RDS")
+saveRDS(data10xIncMultiplets, filenameData10xCompleteIncDoublets)
+# data10xIncMultiplets <- readRDS(filenameData10xCompleteIncDoublets)
+```
+
+```{r removeCellBarcodeMultiplePositive, dependson="assignSampleBarcodes"}
+rownames(data10xIncMultiplets@meta.data) <- data10xIncMultiplets@meta.data$cellBarcode
+cells.tmp <-
+  WhichCells(data10xIncMultiplets, expression = sampleBarcode %in% paste0("HTO-M", 1:10))
+data10x <-
+  subset(data10xIncMultiplets, cells = cells.tmp)
+data10x@meta.data$sampleName <-
+  droplevels(data10x@meta.data$sampleName)
+# keeps 1763 of 2133 cells
+
+rm_tmp(ask=FALSE)
+```
+
+## Filter VDJ sequences to only high-quality singlets, and pull in sampleName
+
+```{r filterData10xVdj, dependson=c("loadData10xVdj", "removeCellBarcodeMultiplePositive")}
+data10xVdj <-
+  data10xVdjUnfiltered %>%
+  dplyr::filter(cellBarcode %in% data10x$cellBarcode) %>%
+  left_join(
+    data10x@meta.data %>% dplyr::select(cellBarcode, sampleName))
+```
+
+## Call BCR isotypes from heavy chain constant gene
+
+```{r callBcrIsotype, dependson=c("filterData10xVdj", "removeCellBarcodeMultiplePositive")}
+# this defines the BCR isotype based on the C gene in the heavy chain of the BCR sequence
+# if there is no heavy chain detected, or if there are multiple heavy chains with different C genes, the isotype is left ambiguous
+data10x@meta.data <-
+  data10x@meta.data %>%
+  left_join(
+    data10xVdj %>%
+      dplyr::filter(chain == "IGH") %>%
+      dplyr::select(cellBarcode, c_gene) %>%
+      unique() %>%
+      group_by(cellBarcode) %>%
+      mutate(count = n()) %>%
+      dplyr::filter(count == 1) %>%
+      mutate(
+        isotypeFromBcrHChain =
+          c_gene %>%
+          str_replace("IGH", "Ig") %>%
+          str_replace("IgG2B", "IgG2b") %>%
+          str_replace("IgG2C", "IgG2c")) %>%
+      dplyr::select(cellBarcode, isotypeFromBcrHChain)
+  ) %>%
+  # replace NAs with "undetermined"
+  mutate(
+    isotypeFromBcrHChain = 
+      case_when(
+        is.na(isotypeFromBcrHChain) ~ "undetermined",
+        isotypeFromBcrHChain == "" ~ "undetermined", # some blanks
+        TRUE ~ isotypeFromBcrHChain) %>%
+      factor(levels = names(palIsotype)))
+rownames(data10x@meta.data) <- data10x@meta.data$cellBarcode
+```
+
+# Normalize, cluster, project, and plot data
+
+```{r createClusterObjects}
+clusterResolution <- c("RNA" = 0.3)
+
+clusterMarkers <- list()
+```
+
+## Normalize, cluster, project, and plot RNAseq data
+
+```{r normalizeClusterProjectRnaData, dependson=c("removeCellBarcodeMultiplePositive", "createClusterObjects")}
+# perform visualization and clustering steps
+
+# normalize data (skip for integrated data, as data already normalized)
+data10x <- NormalizeData(data10x, assay = "RNA", normalization.method = "LogNormalize")
+
+# find variable features (skip for integrated data, as variable features already found)
+data10x <- FindVariableFeatures(data10x, assay = "RNA")
+
+# scale data (skip for integrated data, as data already scaled)
+data10x <- ScaleData(data10x, assay = "RNA")
+
+# run PCA
+data10x <- 
+  RunPCA(data10x, assay = "RNA", verbose = FALSE,
+         reduction.name = "pca_RNA", reduction.key = "pcRNA_")
+
+# find nearest neighbors and shared nearest neighbors
+data10x <-
+  FindNeighbors(
+    data10x, reduction = "pca_RNA", dims = 1:30,
+    graph.name = c("nn_RNA", "snn_RNA"))
+
+# find clusters; due to variations in Seurat reproducibility, clusters may not be identical to published version
+rownames(data10x@meta.data) <- data10x@meta.data$cellBarcode
+data10x <-
+  FindClusters(
+    data10x, graph.name = "snn_RNA",
+    resolution = clusterResolution[["RNA"]],
+    verbose = FALSE)
+
+# make cluster order more logical; will need to be tweaked if anything changes upstream
+Idents(data10x) <-
+  Idents(data10x) %>%
+  dplyr::recode(
+    "0" = "0", # naive cells
+    "5" = "1", # naive cells
+    "3" = "2", # GC B cells
+    "1" = "3", # GC B cells
+    "2" = "4", # GC B cells
+    "4" = "5", # GC B cells
+    "6" = "6" # plasma cells
+  ) %>%
+  factor(levels = str_sort(unique(.), numeric = TRUE))
+
+# store clusters from RNA in metadata
+data10x <- data10x %>%
+  AddMetaData(Idents(data10x), col.name = "seuratClustersRna")
+
+# store broad cell type classifications in metadata
+data10x@meta.data$cellType <-
+  case_when(data10x@meta.data$seuratClustersRna %in% c("0", "1") ~ "naive",
+            data10x@meta.data$seuratClustersRna %in% c("2", "3", "4", "5") ~ "GC",
+            data10x@meta.data$seuratClustersRna %in% c("6") ~ "plasma",
+            TRUE ~ "unknown") %>%
+  factor(levels = c("naive", "GC", "plasma"))
+
+# generate color palette for broad cell type classifications
+pal.cellType <- 
+  big_colorblind_pal(nlevels(data10x@meta.data$cellType)) %>%
+  setNames(levels(data10x@meta.data$cellType))
+
+# run UMAP; due to variations in Seurat reproducibility, UMAP may not be identical to published version
+data10x <-
+  RunUMAP(data10x, reduction = "pca_RNA", dims = 1:30,
+          reduction.name = "umap_RNA", reduction.key = "umapRNA_")
+
+# run tSNE
+data10x <- 
+  RunTSNE(data10x, reduction = "pca_RNA", dims = 1:30,
+          reduction.name = "tsne_RNA", reduction.key = "tsneRNA_")
+```
+
+```{r elbowPlotPcaRnaData, dependson="normalizeClusterProjectRnaData", fig.width=8, fig.height=6}
+ElbowPlot(data10x, reduction = "pca_RNA")
+# looks like 5 or 8 or 13 PCs would be best
+```
+
+```{r findClusterMarkersRnaData, dependson=c("normalizeClusterProjectRnaData", "createClusterObjects")}
+Idents(data10x) <- data10x@meta.data$seuratClustersRna
+clusterMarkers[["RNA"]] <-
+  FindAllMarkers(data10x, assay = "RNA")
+```
+
+```{r writeOutClusterMarkersRnaData, dependson="findClusterMarkersRnaData"}
+nGenesPerCluster.tmp <- 500
+
+filename.tmp <-
+  file.path(
+    dirDataSaved,
+    "clusterMarkersSeuratClustersRna.xlsx")
+
+clusterMarkers[["RNA"]] %>%
+  dplyr::arrange(cluster, p_val) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice(1:nGenesPerCluster.tmp) %>%
+  dplyr::select(cluster, gene, everything()) %>%
+  writexl::write_xlsx(path = filename.tmp, format_headers = FALSE)
+
+rm_tmp(ask=FALSE)
+```
+
+### Plot UMAP of RNAseq data by cluster
+
+```{r plotRnaUmapColorByCluster, dependson="normalizeClusterProjectRnaData", fig.width=9.2, fig.height=7}
+# Figure 5A in manuscript
+plot.tmp <-
+  ggplot(
+    data = data10x@meta.data,
+    mapping =
+      aes(x = data10x@reductions$umap_RNA@cell.embeddings[,1],
+          y = data10x@reductions$umap_RNA@cell.embeddings[,2])) +
+  ggrastr::rasterise(
+    geom_point(
+      mapping = aes(color = seuratClustersRna), 
+      size = 2, alpha = 0.8),
+    dpi = rasterResolutionDpi) +
+  # labs(x = "UMAP 1", y = "UMAP 2") +
+  labs(x = NULL, y = NULL, title = "SFB3340+ B cells") +
+  scale_color_manual(
+    # name = "Cluster"
+    name = NULL,
+    values = big_colorblind_pal(n_distinct(data10x@meta.data$seuratClustersRna))) +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) +
+  theme(plot.title = element_text(hjust = 0.5, size = 32))
+
+# print(plot.tmp)
+
+# output pdf
+as.pdf(
+  plot.tmp,
+  file = file.path(dirPlots, paste0("plotRnaUmapColorByCluster.pdf")),
+  width = 4, height = 4)
+
+rm_tmp(ask=FALSE)
+```
+
+```{r plotRnaUmapColorByClusterFacetBySampleName, dependson="normalizeClusterProjectRnaData", fig.width=15, fig.height=7}
+# Figure S5A in manuscript
+plot.tmp <-
+  ggplot(
+    data = data10x@meta.data,
+    mapping =
+      aes(x = data10x@reductions$umap_RNA@cell.embeddings[,1],
+          y = data10x@reductions$umap_RNA@cell.embeddings[,2],
+          color = sampleName)) +
+  geom_point(
+    mapping = aes(color = seuratClustersRna),
+    size = 2.5, alpha = 0.8) +
+  labs(x = "UMAP 1", y = "UMAP 2") +
+  facet_wrap(~sampleName, nrow = 2, labeller = labeller(sampleName = \(x) str_replace(x, "mouse", "mouse "))) +
+  scale_color_manual(
+    "Cluster", 
+    values = big_colorblind_pal(n_distinct(data10x@meta.data$seuratClustersRna))) +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) +
+  theme(strip.text = element_text(size = rel(0.8), margin = margin(t = 3, b = 3)))
+
+# version without axis labels or legend
+plot.tmp <- plot.tmp +
+  labs(x = NULL, y = NULL) +
+  guides(color = "none")
+
+# print(plot.tmp)
+
+as.pdf(
+  plot.tmp,
+  file = file.path(dirPlots, "plotRnaUmapColorByClusterFacetBySampleName.pdf"),
+  width = 3, height = 3)
+
+rm_tmp(ask=FALSE)
+```
+
+### Plot UMAP of RNAseq data by other variables
+
+```{r plotRnaUmapColorByIsotype, dependson="normalizeClusterProjectRnaData", fig.width=9.2, fig.height=7}
+# Figure 5B in manuscript
+plot.tmp <-
+  ggplot(
+    data = data10x@meta.data,
+    mapping =
+      aes(x = data10x@reductions$umap_RNA@cell.embeddings[,1],
+          y = data10x@reductions$umap_RNA@cell.embeddings[,2],
+          color = isotypeFromBcrHChain)) +
+  geom_point(size = 2, alpha = 0.8) +
+  # labs(x = "UMAP 1", y = "UMAP 2") +
+  labs(x = NULL, y = NULL, title = "Isotypes") +
+  scale_color_manual(
+    # name = ""Isotype\nfrom BCR""
+    name = NULL,
+    values = palIsotype) +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) +
+  theme(plot.title = element_text(hjust = 0.5, size = 32))
+
+# print(plot.tmp)
+
+as.pdf(
+  plot.tmp,
+  file = file.path(dirPlots, "plotRnaUmapColorByIsotype.pdf"),
+  width = 4, height = 4)
+
+rm_tmp(ask=FALSE)
+```
+
+### Plot UMAP of RNAseq data by genes that define major cell type clusters
+
+```{r plotRnaUmapColorByGenesDefineClusters, dependson="normalizeClusterProjectRnaData", fig.width=8, fig.height=7}
+# Figure 5C in manuscript
+genesToPlot.tmp <-
+  c("Ighd", "Aicda", "Prdm1")
+
+plots.tmp <- list()
+for (gene.tmp in genesToPlot.tmp) {
+  data.tmp <-
+    data10x@meta.data %>%
+    # merge UMAP coordinates
+    left_join(
+      data10x@reductions$umap_RNA@cell.embeddings %>%
+        as.data.frame() %>%
+        tibble::rownames_to_column(var = "cellBarcode")
+    ) %>%
+    # merge gene expression data
+    left_join(
+      data10x@assays$RNA@data[gene.tmp,,drop = FALSE] %>%
+        as.matrix() %>%
+        t() %>%
+        as.data.frame() %>%
+        tibble::rownames_to_column(var = "cellBarcode") %>%
+        magrittr::set_colnames(c("cellBarcode", "geneCount"))) %>%
+    dplyr::arrange(geneCount)
+  plots.tmp[[gene.tmp]] <-
+    ggplot(
+      data.tmp,
+      mapping = aes(x = umapRNA_1, y = umapRNA_2, color = geneCount)) +
+    geom_point(size = 2, alpha = 0.8) +
+    # labs(x = "UMAP 1", y = "UMAP 2") +
+    labs(x = NULL, y = NULL, title = gene.tmp) +
+    scale_color_gradient(
+      gene.tmp, low = colsGeneCounts[1], high = colsGeneCounts[2]) +
+    guides(color = "none") +
+    theme(plot.title = element_text(face = "italic", hjust = 0.5, size = 32),
+          plot.margin = margin(0.25, 0.25, 0.25, 0.25, "cm"))
+  if (gene.tmp != genesToPlot.tmp[1])
+    plots.tmp[[gene.tmp]] <- plots.tmp[[gene.tmp]] +
+    theme(axis.text.y = element_blank())
+}
+
+library(cowplot)
+plot.tmp <- plot_grid(plotlist = plots.tmp, ncol = 3, align = "h", rel_widths = c(1.1, 1, 1))
+pdf(file.path(dirPlots, "plotRnaUmapColorByGenesDefineClusters.pdf"),
+    width = 13, height = 5)
+print(plot.tmp)
+invisible(dev.off())
+  
+rm_tmp(ask = FALSE)
+```
+
+# Generate files and calculate parameter values for use by Immcantation/Change-O tools
+
+## Generate files and calculate parameter values for clones within each mouse
+
+### Generate versions of filtered_contig_annotations.csv and filtered_contig.fasta for each mouse
+
+The immcantation workflow for 10x data starts with the outputs filtered_contig_annotations.csv and filtered_contig.fasta. Because we want to run the analysis on each mouse individually, we need to split and filter these files to one for each mouse with only high-quality single B cells.
+
+```{r loadFilterSplitExportFilteredContigAnnotations, dependson="loadData10xVdj"}
+# read in contig annotations (filename specified above)
+filteredContigAnnotations <-
+  read.csv(filenameFilteredContigAnnotations)
+
+# filter and split filtered contig annotations
+filteredContigAnnotationsFilteredSplit <-
+  filteredContigAnnotations %>%
+  # pull in sample information, filter to high-quality singlets only; need to merge on contig or it generates duplicates
+  left_join(
+    data10xVdj %>%
+      dplyr::select(contig_id = cellBarcodeContig, sampleName)) %>%
+  # keep only high-quality singlets
+  dplyr::filter(!is.na(sampleName)) %>% # remove contigs not assigned to a sample
+  # split by sample, and name them
+  group_by(sampleName) %>%
+  dplyr::group_split() %>%
+  setNames(., sapply(., function(x) x$sampleName[1])) %>%
+  # remove sampleName
+  lapply(function(x) as.data.frame(dplyr::select(x, -sampleName)))
+
+# generate directory for output
+dirOutputFilteredContigAnnotationsFilteredSplit <-
+  file.path(dirDataSaved,
+            "filteredContigAnnotationsFilteredSplit")
+if (!dir.exists(dirOutputFilteredContigAnnotationsFilteredSplit))
+  dir.create(dirOutputFilteredContigAnnotationsFilteredSplit)
+
+# write out filtered, split files
+for (sample.tmp in names(filteredContigAnnotationsFilteredSplit))
+  write_csv(
+    filteredContigAnnotationsFilteredSplit[[sample.tmp]],
+    file.path(
+        dirOutputFilteredContigAnnotationsFilteredSplit,
+        paste("filteredContigAnnotationsFilteredSplit", sample.tmp,
+              "csv", sep = ".")))
+
+rm_tmp(ask=FALSE)
+```
+
+```{r loadFilterSplitExportFilteredContigFasta, dependson="loadData10xVdj"}
+# read in contig FASTA file
+filenameFilteredContigFasta <-
+  file.path(dirData, "filtered_contig.fasta")
+filteredContigFasta <-
+  readr::read_lines(filenameFilteredContigFasta)
+
+# filter and split filtered contig FASTA
+filteredContigFastaFilteredSplit <- list()
+for (sample.tmp in levels(data10xVdj$sampleName)) {
+  # identify lines corresponding to sample
+  lines.tmp <-
+    which(str_replace_all(filteredContigFasta, "\\>", "") %in%
+            (data10xVdj %>% dplyr::filter(sampleName %in% sample.tmp) %>%
+               dplyr::pull(cellBarcodeContig))) %>%
+    # include line and next line
+    rep(each = 2) + c(0,1)
+  # pull lines
+  filteredContigFastaFilteredSplit[[sample.tmp]] <-
+    filteredContigFasta[lines.tmp]
+}
+
+# generate directory for output
+dirOutputFilteredContigFastaFilteredSplit <-
+  file.path(dirDataSaved, "filteredContigFastaFilteredSplit")
+if (!dir.exists(dirOutputFilteredContigFastaFilteredSplit))
+  dir.create(dirOutputFilteredContigFastaFilteredSplit)
+
+# write out filtered, split files
+for (sample.tmp in names(filteredContigFastaFilteredSplit))
+  readr::write_lines(
+    filteredContigFastaFilteredSplit[[sample.tmp]],
+    file =
+      file.path(
+        dirOutputFilteredContigFastaFilteredSplit,
+        paste("filteredContigFastaFilteredSplit", sample.tmp,
+              "fasta", sep = ".")))
+
+rm_tmp(ask=FALSE)
+```
+
+### Determine optimal threshold for clone calling within each mouse
+
+```{r runDistToNearest, dependson="loadFilterSplitByChainExportFilteredContigFasta"}
+# split filtered contig annotations, by mouse and heavy/light chain
+filteredContigAnnotationsFilteredSplitByChain <-
+  filteredContigAnnotations %>%
+  # pull in sample information, for high-quality singlets only; need to merge on contig or it generates duplicates
+  left_join(
+    data10xVdj %>%
+      dplyr::select(contig_id = cellBarcodeContig, sampleName)) %>%
+  # keep only high-quality singlets
+  dplyr::filter(!is.na(sampleName)) %>%
+  # split by sample, and name them
+  group_by(sampleName) %>%
+  dplyr::group_split() %>%
+  setNames(., sapply(., function(x) x$sampleName[1])) %>%
+  # remove sampleName
+  lapply(function(x) as.data.frame(dplyr::select(x, -sampleName)))
+# split into heavy and light chain
+for (sample.tmp in names(filteredContigAnnotationsFilteredSplitByChain)) {
+  filteredContigAnnotationsFilteredSplitByChain[[sample.tmp]] <-
+    list(
+      heavy =
+        filteredContigAnnotationsFilteredSplitByChain[[sample.tmp]] %>%
+        dplyr::filter(chain %in% "IGH"),
+      light =
+        filteredContigAnnotationsFilteredSplitByChain[[sample.tmp]] %>%
+        dplyr::filter(chain %in% c("IGK", "IGL")))
+}
+
+bcrDistToNearestFilteredSplit <- list()
+for (chain.tmp in c("heavy", "light"))
+  bcrDistToNearestFilteredSplit[[chain.tmp]] <-
+  lapply(
+    filteredContigAnnotationsFilteredSplitByChain,
+    \(x) shazam::distToNearest(x[[chain.tmp]],
+                               sequenceColumn = "cdr3_nt",
+                               vCallColumn = "v_gene",
+                               jCallColumn = "j_gene")) %>%
+  bind_rows(.id = "sampleName")
+
+# print distributions of distances to nearest neighbor, without threshold
+for (chain.tmp in names(bcrDistToNearestFilteredSplit)) {
+  plot.tmp <-
+    ggplot(bcrDistToNearestFilteredSplit[[chain.tmp]],
+           mapping = aes(x = dist_nearest)) +
+    geom_histogram(breaks = 30) +
+    geom_density() +
+    xlim(0, 0.2) +
+    facet_wrap(vars(sampleName), nrow = 2) +
+    labs(title = chain.tmp)
+  print(plot.tmp)
+}
+
+# this is set empirically based on the distribution of distances
+thresholdDistToNearest.tmp <- 0.045
+
+# print distributions of distances to nearest neighbor, with threshold
+for (chain.tmp in names(bcrDistToNearestFilteredSplit)) {
+  plot.tmp <-
+    ggplot(bcrDistToNearestFilteredSplit[[chain.tmp]],
+           mapping = aes(x = dist_nearest)) +
+    geom_histogram(breaks = 30) +
+    geom_density() +
+    xlim(0, 0.2) +
+    facet_wrap(vars(sampleName), nrow = 2) +
+    geom_vline(xintercept = thresholdDistToNearest.tmp,
+               color = "blue", linetype = "dashed") +
+    labs(title = chain.tmp)
+  print(plot.tmp)
+}
+
+rm_tmp(ask = FALSE)
+```
+
+## Generate files and calculate parameter values for clones merged across mice
+
+Inferring clones from multiple mice does not make sense for a number of the analyses. But where we are interested in mutation locations or "public" clones of similar BCRs across mice, this could be quite informative as it aggregates information. We will need to keep track of which cells come from which mouse, so that we can differentiate between mutations that are shared across mice and those that are not.
+
+### Generate versions of filtered_contig_annotations.csv and filtered_contig.fasta for all mice
+
+The immcantation workflow for 10x data starts with the outputs filtered_contig_annotations.csv and filtered_contig.fasta. Because we want to run the analysis only on high-quality single cells, we need to filter these files to only high-quality single B cells.
+
+```{r loadFilterExportFilteredContigAnnotationsAggregateMice, dependson="loadData10xVdj"}
+# use filteredContigAnnotations loaded above as input
+
+# filter filtered contig annotations to only called cells
+filteredContigAnnotationsAggregateMiceFiltered <-
+  filteredContigAnnotations %>%
+  # pull in sample information, for high-quality singlets only; need to merge on contig or it generates duplicates
+  left_join(
+    data10xVdj %>%
+      dplyr::select(contig_id = cellBarcodeContig, sampleName)) %>%
+  # keep only high-quality singlets
+  dplyr::filter(!is.na(sampleName)) %>%
+  # keep sampleName
+  # dplyr::select(-sampleName) %>%
+  as.data.frame()
+
+# generate directory
+dirOutputFilteredContigAnnotationsAggregateMiceFiltered <-
+  file.path(dirDataSaved,
+            "filteredContigAnnotationsAggregateMiceFiltered")
+if (!dir.exists(dirOutputFilteredContigAnnotationsAggregateMiceFiltered))
+  dir.create(dirOutputFilteredContigAnnotationsAggregateMiceFiltered)
+
+# write out filtered files
+write_csv(
+  filteredContigAnnotationsAggregateMiceFiltered,
+  file.path(
+    dirOutputFilteredContigAnnotationsAggregateMiceFiltered,
+    paste("filteredContigAnnotationsAggregateMiceFiltered",
+          "csv", sep = ".")))
+
+rm_tmp(ask=FALSE)
+```
+
+```{r loadFilterExportFilteredContigFastaAggregateMice, dependson="loadData10xVdj"}
+# use filteredContigFasta loaded above as input
+
+# filter and split filtered contig FASTA
+# filteredContigFastaAggregateMiceFiltered <- list()
+# identify lines corresponding to cells
+lines.tmp <-
+  which(str_replace_all(filteredContigFasta, "\\>", "") %in%
+          (data10xVdj %>%
+             dplyr::pull(cellBarcodeContig))) %>%
+  # include line and next line
+  rep(each = 2) + c(0,1)
+# pull lines
+filteredContigFastaAggregateMiceFiltered <-
+  filteredContigFasta[lines.tmp]
+
+# generate directory
+dirOutputFilteredContigFastaAggregateMiceFiltered <-
+  file.path(dirDataSaved,
+            "filteredContigFastaAggregateMiceFiltered")
+if (!dir.exists(dirOutputFilteredContigFastaAggregateMiceFiltered))
+  dir.create(dirOutputFilteredContigFastaAggregateMiceFiltered)
+
+# write out filtered file
+readr::write_lines(
+  filteredContigFastaAggregateMiceFiltered,
+  file =
+    file.path(
+      dirOutputFilteredContigFastaAggregateMiceFiltered,
+      paste("filteredContigFastaAggregateMiceFiltered",
+            "fasta", sep = ".")))
+
+rm_tmp(ask=FALSE)
+```
+
+### Generate versions of filtered_contig_annotations.csv and filtered_contig.fasta for mice and each chain
+
+```{r loadFilterSplitByChainExportFilteredContigAnnotationsAggregateMice, dependson="loadData10xVdj"}
+# use filteredContigAnnotations loaded above as input
+
+# filter and split filtered contig annotations, by mouse and heavy/light chain
+# downstream tools act on heavy or light chain, not both at the same time
+filteredContigAnnotationsAggregateMiceFilteredSplitByChain <-
+  filteredContigAnnotations %>%
+  # pull in sample information, for high-quality singlets only; need to merge on contig or it generates duplicates
+  left_join(
+    data10xVdj %>%
+      dplyr::select(contig_id = cellBarcodeContig, sampleName)) %>%
+  # keep only high-quality singlets
+  dplyr::filter(!is.na(sampleName))
+
+# split into heavy and light chain
+filteredContigAnnotationsAggregateMiceFilteredSplitByChain <-
+  list(
+    heavy =
+      filteredContigAnnotationsAggregateMiceFilteredSplitByChain %>%
+      dplyr::filter(chain %in% "IGH"),
+    light =
+      filteredContigAnnotationsAggregateMiceFilteredSplitByChain %>%
+      dplyr::filter(chain %in% c("IGK", "IGL")))
+
+# generate directory and filenames
+dirOutputFilteredContigAnnotationsAggregateMiceFilteredSplitByChain <-
+  file.path(
+    dirDataSaved,
+    "filteredContigAnnotationsAggregateMiceFilteredSplitByChain")
+if (!dir.exists(dirOutputFilteredContigAnnotationsAggregateMiceFilteredSplitByChain))
+  dir.create(dirOutputFilteredContigAnnotationsAggregateMiceFilteredSplitByChain)
+
+# write out filtered, split files
+for (chain.tmp in names(filteredContigAnnotationsAggregateMiceFilteredSplitByChain)) {
+  write_csv(
+    filteredContigAnnotationsAggregateMiceFilteredSplitByChain[[chain.tmp]],
+    file = 
+      file.path(
+        dirOutputFilteredContigAnnotationsAggregateMiceFilteredSplitByChain,
+        paste(
+          "filteredContigAnnotationsAggregateMiceFilteredSplitByChain",
+          chain.tmp,
+          "csv", sep = ".")))
+}
+
+rm_tmp(ask=FALSE)
+```
+
+```{r loadFilterSplitByChainExportFilteredContigFastaAggregateMice, dependson="loadData10xVdj"}
+# use filteredContigFasta loaded above as input
+
+# set chain names for heavy and light chains
+chainNames.tmp <-
+  list(heavy = "IGH",
+       light = c("IGK", "IGL"))
+# filter and split filtered contig FASTA
+filteredContigFastaAggregateMiceFilteredSplitByChain <- list()
+for (chain.tmp in c("heavy", "light")) {
+  # identify lines corresponding to sample
+  lines.tmp <-
+    which(
+      str_replace_all(filteredContigFasta, "\\>", "") %in%
+        (data10xVdj %>%
+           dplyr::filter(
+             chain %in% chainNames.tmp[[chain.tmp]]) %>%
+           dplyr::pull(cellBarcodeContig))) %>%
+    # include line and next line
+    rep(each = 2) + c(0,1)
+  # pull lines
+  filteredContigFastaAggregateMiceFilteredSplitByChain[[chain.tmp]] <-
+    filteredContigFasta[lines.tmp]
+}
+
+# generate directory and filenames
+dirOutputFilteredContigFastaAggregateMiceFilteredSplitByChain <-
+  file.path(dirDataSaved,
+            "filteredContigFastaAggregateMiceFilteredSplitByChain")
+if (!dir.exists(dirOutputFilteredContigFastaAggregateMiceFilteredSplitByChain))
+  dir.create(dirOutputFilteredContigFastaAggregateMiceFilteredSplitByChain)
+
+# write out filtered, split files
+for (chain.tmp in names(filteredContigFastaAggregateMiceFilteredSplitByChain)) {
+  readr::write_lines(
+    filteredContigFastaAggregateMiceFilteredSplitByChain[[chain.tmp]],
+    file =
+      file.path(
+        dirOutputFilteredContigFastaAggregateMiceFilteredSplitByChain,
+        paste(
+          "filteredContigFastaAggregateMiceFilteredSplitByChain",
+          chain.tmp,
+          "fasta", sep = ".")))
+}
+
+rm_tmp(ask=FALSE)
+```
+
+### Determine optimal threshold for clone calling across mice
+
+```{r runDistToNearestAggregateMice, dependson="loadFilterExportFilteredContigAnnotationsAggregateMice", fig.width=6, fig.height=5}
+bcrDistToNearestAggregateMiceFiltered <-
+  shazam::distToNearest(
+    filteredContigAnnotationsAggregateMiceFiltered,
+    sequenceColumn = "cdr3_nt",
+    vCallColumn = "v_gene",
+    jCallColumn = "j_gene")
+
+# print distributions of distances to nearest neighbor, without threshold
+ggplot(bcrDistToNearestAggregateMiceFiltered,
+       mapping = aes(x = dist_nearest)) +
+  geom_histogram(breaks = 30) +
+  geom_density() +
+  xlim(0, 0.2) +
+  labs(x = "Distance to nearest neighbor")
+
+# this is set empirically based on the distribution of distances to nearest neighbor
+thresholdDistToNearest.tmp <- 0.045
+# value is same for aggregated mice and for split
+
+# print distributions of distances to nearest neighbor, with threshold
+ggplot(bcrDistToNearestAggregateMiceFiltered,
+       mapping = aes(x = dist_nearest)) +
+  geom_histogram(breaks = 30) +
+  geom_density() +
+  xlim(0, 0.2) +
+  geom_vline(xintercept = thresholdDistToNearest.tmp,
+             color = "blue", linetype = "dashed")
+
+rm_tmp(ask = FALSE)
+```
+
+
+# Save objects for later use
+
+```{r saveObjects, dependson="loadData10xVdj"}
+# save objects for later use
+save(list = c("data10x", "data10xVdj",
+              "dirOutputFilteredContigFastaFilteredSplit",
+              "dirOutputFilteredContigFastaAggregateMiceFiltered",
+              "filteredContigAnnotationsAggregateMiceFiltered"),
+     file = file.path(dirDataSaved, "data10x.RData"))
+```
+
+
+# Output R session information
+
+```{r output_session_info, cache=FALSE}
+miscHelpers::print_session_info()
+```
