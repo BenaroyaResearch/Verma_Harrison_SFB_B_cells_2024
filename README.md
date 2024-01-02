@@ -1,7 +1,5 @@
 Analysis of 10x gene expression and BCR sequence data associated with Verma et al. 2023 (https://doi.org/10.1101/2023.10.13.562275)
 
-Matt Dufort
-
 
 
 This set of scripts performs the analyses and generates the visualizations presented in Verma et al. 2023, "Antigen-level resolution of commensal-specific B cell responses enabled by phage-display screening and B cell tetramers".
